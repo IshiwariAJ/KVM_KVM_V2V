@@ -179,6 +179,36 @@ def _transfer_fuse_source(
             raise MigrationError(f"rsync 失敗 (ステップ 2/2):\n{r2.stderr}")
 
 
+def _stream_local_to_gvfs(src_path: str, dst_path: str, log: ProgressCallback) -> None:
+    """/tmp を使わずローカル (root 所有) → GVFS へ直接ストリームコピーする。
+    ユーザープロセスが GVFS ファイルを開き、stdout 経由で sudo dd に渡す。
+    """
+    try:
+        size_mb = os.path.getsize(src_path) // (1024 * 1024)
+        log(f"  直接コピー中 ({size_mb} MB): {src_path} → {dst_path}")
+    except OSError:
+        log(f"  直接コピー中: {src_path} → {dst_path}")
+    try:
+        dst_file = open(dst_path, "wb")  # noqa: WPS515  — with 外で開く必要あり
+    except PermissionError as exc:
+        raise MigrationError(
+            f"GVFS への書き込みに失敗しました。\n"
+            f"Samba 共有の書き込み権限を確認してください。\n{exc}"
+        ) from exc
+    with dst_file:
+        proc = subprocess.Popen(
+            ["sudo", "dd", f"if={src_path}", "bs=4M"],
+            stdout=dst_file,
+            stderr=subprocess.PIPE,
+        )
+        _, stderr = proc.communicate()
+    if proc.returncode != 0:
+        raise MigrationError(
+            f"コピー失敗 (sudo dd):\n{stderr.decode('utf-8', errors='replace')}"
+        )
+    log("  コピー完了")
+
+
 def _transfer_to_fuse_dest(
     src_path: str,
     dst_path: str,
@@ -186,25 +216,21 @@ def _transfer_to_fuse_dest(
     log: ProgressCallback,
 ) -> None:
     """GVFS 等の FUSE マウントへの転送 (バックアップ用)。
-    sudo rsync は GVFS に書き込めないため /tmp を中継し、shutil で GVFS へ書き込む。
-    ローカルソースが root 所有の場合は --chmod=644 で /tmp 内ファイルをユーザー可読にする。
+    ローカルソースは /tmp を介さず sudo dd で直接ストリームコピーする。
+    SSH ソースは /tmp を中継する。
     """
+    if src_host.connection_type == ConnectionType.LOCAL:
+        _stream_local_to_gvfs(src_path, dst_path, log)
+        return
+
+    # SSH ソース: /tmp を中継
     filename = os.path.basename(dst_path)
     with tempfile.TemporaryDirectory(prefix="kvm_backup_") as tmp_dir:
         tmp_path = os.path.join(tmp_dir, filename)
         local = HostConfig()
 
         log(f"  ステップ 1/2: コピー元 → 一時ディレクトリ: {src_path}")
-        if src_host.connection_type == ConnectionType.LOCAL:
-            # root 所有ファイルを sudo rsync で読み、/tmp にはユーザーが読めるモードで書く
-            step1_cmd = [
-                "sudo", "rsync", "-avz", "--progress",
-                "--no-perms", "--chmod=644",
-                src_path, tmp_path,
-            ]
-        else:
-            # SSH ソース: sudo 不要
-            step1_cmd = _build_rsync_cmd(src_path, tmp_path, src_host, local)
+        step1_cmd = _build_rsync_cmd(src_path, tmp_path, src_host, local)
         r1 = subprocess.run(step1_cmd, capture_output=True, text=True)
         if r1.returncode != 0:
             raise MigrationError(f"コピー失敗 (ステップ 1/2):\n{r1.stderr}")
